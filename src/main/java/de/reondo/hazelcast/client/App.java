@@ -76,7 +76,7 @@ public class App {
         // Create threads
         HazelcastInstance client = createHazelcastClient(hazelcastHosts);
         LOGGER.info("Clearing map (size={})", client.getMap(ANGEBOTE).size());
-        client.getMap(ANGEBOTE).clear();
+//        client.getMap(ANGEBOTE).clear();
         long startTime;
         try {
             for (int i = 0; i < ts.length; ++i) {
