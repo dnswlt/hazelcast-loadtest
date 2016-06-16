@@ -12,9 +12,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
-import java.text.SimpleDateFormat;
 import java.util.Arrays;
-import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
@@ -76,7 +74,7 @@ public class App {
         // Create threads
         HazelcastInstance client = createHazelcastClient(hazelcastHosts);
         LOGGER.info("Clearing map (size={})", client.getMap(ANGEBOTE).size());
-        client.getMap(ANGEBOTE).clear();
+//        client.getMap(ANGEBOTE).clear();
         long startTime;
         try {
             for (int i = 0; i < ts.length; ++i) {
@@ -146,11 +144,8 @@ public class App {
                 (double)summary.getWritePercentile(0.99)/NANOS_IN_MILLIS,
                 (double)summary.getWritePercentile(0.95)/NANOS_IN_MILLIS,
                 String.format(Locale.US, "%.2f", summary.getWriteMeanMillis()));
-        File resultFile = new File(String.format("timings_%s.csv",
-                new SimpleDateFormat("yyyy-MM-dd'T'HHmmss").format(new Date())));
-        summary.saveEntries(resultFile);
+        summary.saveEntries();
     }
-
 
     private HazelcastInstance createHazelcastClient(List<String> hazelcastHosts) {
         ClientConfig clientConfig = new ClientConfig();
