@@ -8,9 +8,11 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.Writer;
+import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.List;
 
 import static de.reondo.hazelcast.client.StatEntry.Type.READ;
@@ -41,6 +43,11 @@ public class StatSummary {
             }
         });
         this.entries = entries;
+    }
+
+    private File getStatFile() {
+        return new File(String.format("timings_%s.csv",
+                new SimpleDateFormat("yyyy-MM-dd'T'HHmmss").format(new Date())));
     }
 
     public long getReadMin() {
@@ -180,9 +187,9 @@ public class StatSummary {
 
     /**
      * Write all entries sorted by start time to given file.
-     * @param file
      */
-    public void saveEntries(File file) {
+    public void saveEntries() {
+        File file = getStatFile();
         try (Writer writer = new BufferedWriter(new FileWriter(file))) {
             writer.write("ThreadId;Type;Success;Start;Duration\n");
             for (StatEntry e : entries) {

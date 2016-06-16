@@ -4,9 +4,13 @@ import com.hazelcast.core.HazelcastInstance;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.*;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.function.ObjDoubleConsumer;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.UUID;
 
 import static de.reondo.hazelcast.client.App.NANOS_IN_MILLIS;
 import static de.reondo.hazelcast.client.StatEntry.Type.READ;
@@ -24,7 +28,9 @@ public class HazelWorker implements Runnable {
     private static final Deque<String> offerQueue = new LinkedList<>();
     private static final Object offerQueueLock = new Object();
 
-    private static final List<StatEntry> statEntries = Collections.synchronizedList(new ArrayList<>());
+    private static final List<StatEntry> statEntries = new ArrayList<>();
+    private static final Object statEntriesLock = new Object();
+    public static final int STAT_ENTRIES_LIMIT = 1000000;
 
     private final long durationMillis;
     private final int warmupMillis;
@@ -128,7 +134,20 @@ public class HazelWorker implements Runnable {
     }
 
     private void addStat(StatEntry.Type type, long threadId, long startNanos, long durationNanos, boolean success) {
-        statEntries.add(new StatEntry(type, threadId, success, startNanos, durationNanos));
+        List<StatEntry> saveBlock = null;
+        synchronized (statEntriesLock) {
+            statEntries.add(new StatEntry(type, threadId, success, startNanos, durationNanos));
+            if (statEntries.size() > STAT_ENTRIES_LIMIT) {
+                // save stats every 1'000'000 entries to avoid OOM
+                saveBlock = getStatEntries();
+                statEntries.clear();
+            }
+        }
+        if (saveBlock != null) {
+            LOGGER.info("Cleared {} stat entries to restrict memory consumption.", saveBlock.size());
+            StatSummary summary = new StatSummary(saveBlock);
+            summary.saveEntries();
+        }
     }
 
     /**
@@ -171,7 +190,7 @@ public class HazelWorker implements Runnable {
             }
         }
         if (doThrottle) {
-            pauseMillis = Math.max(20, pauseMillis * 2);
+            pauseMillis = Math.max(20, pauseMillis + pauseMillis/2);
             LOGGER.info("Cleared queue, throttled threads to pauseMillis={}", pauseMillis);
         }
     }
@@ -220,7 +239,9 @@ public class HazelWorker implements Runnable {
     }
 
     public static List<StatEntry> getStatEntries() {
-        return new ArrayList<>(statEntries);
+        synchronized (statEntriesLock) {
+            return new ArrayList<>(statEntries);
+        }
     }
 
 }
