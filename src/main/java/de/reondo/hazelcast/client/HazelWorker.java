@@ -101,7 +101,7 @@ public class HazelWorker implements Runnable {
                 if (i == 0) {
                     synchronized (offerQueueLock) {
                         int len = offerQueue.size();
-                        if (len < 100 || rnd.nextDouble() < probSale) {
+                        if (len == 0 || rnd.nextDouble() < probSale) {
                             // Add offer to queue
                             offerQueue.addLast(new QueueEntry<>(offerId));
                             if (len > 100000) {
