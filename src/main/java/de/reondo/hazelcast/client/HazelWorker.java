@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static de.reondo.hazelcast.client.App.NANOS_IN_MILLIS;
 import static de.reondo.hazelcast.client.StatEntry.Type.READ;
@@ -25,30 +26,34 @@ public class HazelWorker implements Runnable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(HazelWorker.class);
 
-    private static final Deque<String> offerQueue = new LinkedList<>();
+    private static final Deque<QueueEntry<String>> offerQueue = new LinkedList<>();
     private static final Object offerQueueLock = new Object();
+    private static final AtomicInteger totalOfferCounter = new AtomicInteger();
 
     private static final List<StatEntry> statEntries = new ArrayList<>();
     private static final Object statEntriesLock = new Object();
     public static final int STAT_ENTRIES_LIMIT = 1000000;
 
     private final long durationMillis;
-    private final int warmupMillis;
-    private static int pauseMillis;
+    private final long warmupMillis;
+    private static long pauseMillis;
     private final int numBytes;
     private final int numOffers;
     private final double probSale;
     private final HazelcastInstance client;
     private final Random rnd;
+    private final boolean throttlingEnabled;
     private int queueClock;
+    private int totalOfferCounterOnLastQueueReset;
 
-    public HazelWorker(long durationMillis, int warmupMillis, int pauseMillis, int numBytes, int numOffers, double probSale, HazelcastInstance client) {
-        this.durationMillis = durationMillis;
-        this.warmupMillis = warmupMillis;
-        this.pauseMillis = pauseMillis;
-        this.numBytes = numBytes;
-        this.numOffers = numOffers;
-        this.probSale = probSale;
+    public HazelWorker(Config config, HazelcastInstance client) {
+        this.durationMillis = config.getDurationMillis();
+        this.warmupMillis = config.getWarmupMillis();
+        this.pauseMillis = config.getPauseMillis();
+        this.numBytes = config.getNumBytes();
+        this.numOffers = config.getNumOffers();
+        this.probSale = config.getProbSale();
+        this.throttlingEnabled = config.isThrottlingEnabled();
         rnd = new Random();
         this.client = client;
     }
@@ -96,9 +101,9 @@ public class HazelWorker implements Runnable {
                 if (i == 0) {
                     synchronized (offerQueueLock) {
                         int len = offerQueue.size();
-                        if (len < 10000 || rnd.nextDouble() < probSale) {
+                        if (len == 0 || rnd.nextDouble() < probSale) {
                             // Add offer to queue
-                            offerQueue.addLast(offerId);
+                            offerQueue.addLast(new QueueEntry<>(offerId));
                             if (len > 100000) {
                                 while (len-- > 50000) {
                                     offerQueue.removeFirst(); // avoid oversized queue
@@ -156,7 +161,7 @@ public class HazelWorker implements Runnable {
      * @param map
      */
     private boolean buyOffer(Map<String, byte[]> map) {
-        String key;
+        QueueEntry<String> key;
         int qClock = 0;
         synchronized (offerQueueLock) {
             key = offerQueue.pollFirst();
@@ -166,10 +171,11 @@ public class HazelWorker implements Runnable {
 //            LOGGER.error("Offer queue is empty, load test bug.");
             return false;
         }
-        byte[] data = map.get(key);
+        byte[] data = map.get(key.getValue());
         if (data == null) {
-            LOGGER.debug("Offer for key {} not found in map. Throttling thread.", key);
-            throttle(qClock);
+            if (throttlingEnabled) {
+                throttle(qClock, map, key);
+            }
             return false;
         }
         if (data.length != numBytes) {
@@ -179,18 +185,29 @@ public class HazelWorker implements Runnable {
         return true;
     }
 
-    private void throttle(int qClock) {
+    private void throttle(int qClock, Map<String, byte[]> map, QueueEntry<String> key) {
+        int delta = 0;
         boolean doThrottle = true;
+        int queueSize = 0;
+        int mapSize = 0;
         synchronized (offerQueueLock) {
+            int cntNow = totalOfferCounter.get();
             if (qClock == queueClock) {
+                queueSize = offerQueue.size();
+                mapSize = map.size();
                 offerQueue.clear();
                 queueClock++;
+                pauseMillis = Math.max(20, pauseMillis + pauseMillis/2);
+                delta = cntNow - totalOfferCounterOnLastQueueReset;
+                totalOfferCounterOnLastQueueReset = cntNow;
             } else {
                 doThrottle = false;
             }
         }
         if (doThrottle) {
-            pauseMillis = Math.max(20, pauseMillis + pauseMillis/2);
+            LOGGER.debug("Offer for key {} not found in map. Queue size {}, Map size {}, " +
+                            "map inserts since last throttling {}. Throttling threads.",
+                    key, queueSize, mapSize, delta);
             LOGGER.info("Cleared queue, throttled threads to pauseMillis={}", pauseMillis);
         }
     }
@@ -206,6 +223,7 @@ public class HazelWorker implements Runnable {
         rnd.nextBytes(data);
         String key = UUID.randomUUID().toString();
         map.put(key, data);
+        totalOfferCounter.incrementAndGet();
         return key;
     }
 

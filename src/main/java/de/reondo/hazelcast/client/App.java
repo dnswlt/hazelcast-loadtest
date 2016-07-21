@@ -10,7 +10,6 @@ import joptsimple.OptionException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
@@ -44,6 +43,10 @@ public class App {
         parser.accepts("h", "Comma-separated list of Hazelcast hostnames").withRequiredArg().ofType(String.class).defaultsTo("localhost");
         parser.accepts("w", "Warmup time in seconds").withRequiredArg().ofType(Integer.class).defaultsTo(5);
         parser.accepts("p", "Pause in milliseconds between two iterations").withRequiredArg().ofType(Integer.class).defaultsTo(0);
+        parser.accepts("l", "Disable throttling in case of failed reads");
+        parser.accepts("c", "Clear map before start of test");
+        parser.accepts("dummy", "Disable smart routing (dummy client)");
+        parser.accepts("redo", "Enable redo-able operations");
         parser.accepts("help", "Print help").forHelp();
         OptionSet options;
         try {
@@ -56,32 +59,37 @@ public class App {
             printHelpAndExit(parser);
         }
 
-        int durationMillis = (int) options.valueOf("d") * 1000;
-        int numBytes = (int) options.valueOf("b");
-        int numOffers = (int) options.valueOf("n");
-        double probSale = (double) options.valueOf("s");
-        int numThreads = (int) options.valueOf("t");
-        int warmupMillis = (int) options.valueOf("w") * 1000;
-        int pauseMillis = (int) options.valueOf("p");
+        ConfigBuilder cfg = new ConfigBuilder();
+        cfg.setDurationMillis((Integer) options.valueOf("d") * 1000L);
+        cfg.setNumBytes((Integer) options.valueOf("b"));
+        cfg.setNumOffers((Integer) options.valueOf("n"));
+        cfg.setProbSale((Double) options.valueOf("s"));
+        cfg.setNumThreads((Integer) options.valueOf("t"));
+        cfg.setWarmupMillis((Integer) options.valueOf("w") * 1000L);
+        cfg.setPauseMillis((Integer) options.valueOf("p") * 1L);
+        cfg.setThrottlingEnabled(!options.has("l"));
+        cfg.setClearMap(options.has("c"));
         List<String> hazelcastHosts = Arrays.asList(((String)options.valueOf("h")).split(","));
+        cfg.setHazelcastHosts(hazelcastHosts);
 
-        LOGGER.info("Starting test with config:\n  threads={}, duration={}s, pause={}ms, bytes-per-key={}, offers-per-iter={}, " +
-                "look-book-ratio={}%, hazelcast-hosts={}", numThreads, durationMillis/1000, pauseMillis, numBytes, numOffers,
-                String.format(Locale.US, "%.2f", probSale * 100.0), hazelcastHosts);
+        Config config = cfg.createConfig();
+        LOGGER.info("Starting test with config:\n  {}", config);
 
-        Thread[] ts = new Thread[numThreads];
+        Thread[] ts = new Thread[config.getNumThreads()];
         HazelWorker[] workers = new HazelWorker[ts.length];
         // Create threads
-        HazelcastInstance client = createHazelcastClient(hazelcastHosts);
-        LOGGER.info("Clearing map (size={})", client.getMap(ANGEBOTE).size());
-//        client.getMap(ANGEBOTE).clear();
-        long startTime;
+        HazelcastInstance client = createHazelcastClient(config.getHazelcastHosts(), options.has("dummy"), options.has("redo"));
+
+        if (config.isClearMap()) {
+            LOGGER.info("Clearing map (size={})", client.getMap(ANGEBOTE).size());
+            client.getMap(ANGEBOTE).clear();
+        }
         try {
             for (int i = 0; i < ts.length; ++i) {
-                workers[i] = new HazelWorker(durationMillis, warmupMillis, pauseMillis, numBytes, numOffers, probSale, client);
+                workers[i] = new HazelWorker(config, client);
                 ts[i] = new Thread(workers[i]);
             }
-            startTime = System.nanoTime();
+            long startTime = System.nanoTime();
             // Start threads
             for (int i = 0; i < ts.length; ++i) {
                 ts[i].start();
@@ -147,12 +155,20 @@ public class App {
         summary.saveEntries();
     }
 
-    private HazelcastInstance createHazelcastClient(List<String> hazelcastHosts) {
+    private HazelcastInstance createHazelcastClient(List<String> hazelcastHosts, boolean isDummy, boolean isRedo) {
         ClientConfig clientConfig = new ClientConfig();
         // Only works as system property, not if set as follows o_O
         // clientConfig.setProperty("hazelcast.logging.type", "none");
         ClientNetworkConfig clientNetworkConfig = new ClientNetworkConfig();
         clientNetworkConfig.setAddresses(hazelcastHosts);
+        if (isDummy) {
+            LOGGER.info("Disabling smart routing (dummy client)");
+            clientNetworkConfig.setSmartRouting(false);
+        }
+        if (isRedo) {
+            LOGGER.info("Enabling redo-operation");
+            clientNetworkConfig.setRedoOperation(true);
+        }
         clientConfig.setNetworkConfig(clientNetworkConfig);
         return HazelcastClient.newHazelcastClient(clientConfig);
     }
