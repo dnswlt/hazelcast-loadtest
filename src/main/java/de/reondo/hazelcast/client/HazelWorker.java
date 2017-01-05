@@ -61,14 +61,7 @@ public class HazelWorker implements Runnable {
     @Override
     public void run() {
 
-        try {
-            Map<String, byte[]> warmupMap = client.getMap(App.ANGEBOTE + "-warmup");
-            doWarmup(warmupMap);
-        } catch (Exception e) {
-            LOGGER.error("Warmup failed. Aborting.", e);
-            return;
-        }
-        long delayMillis = rnd.nextInt(1000) + 1;
+        long delayMillis = rnd.nextInt((int)warmupMillis);
         LOGGER.debug("Delaying start of timing for {}ms", delayMillis);
         try {
             Thread.sleep(delayMillis);
@@ -238,23 +231,6 @@ public class HazelWorker implements Runnable {
         return k - 1;
     }
 
-
-    private void doWarmup(Map<String, byte[]> map) {
-        long warmupTime = warmupMillis * NANOS_IN_MILLIS;
-        long started = System.nanoTime();
-        long now = started;
-        int count = 0;
-        byte[] data = new byte[numBytes];
-        long threadId = Thread.currentThread().getId();
-        LOGGER.info("Starting warmup for {}ms", warmupTime / 1000000);
-        while (now < started + warmupTime) {
-            rnd.nextBytes(data);
-            map.put(String.format("warmup-%d-%d", threadId, count), data);
-            ++count;
-            now = System.nanoTime();
-        }
-        LOGGER.debug("Added {} keys. Finished warmup.", count);
-    }
 
     public static List<StatEntry> getStatEntries() {
         synchronized (statEntriesLock) {
