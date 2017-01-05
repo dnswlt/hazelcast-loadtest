@@ -1,6 +1,7 @@
 package de.reondo.hazelcast.client;
 
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.IMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,7 +35,8 @@ public class HazelWorker implements Runnable {
 
     private static final List<StatEntry> statEntries = new ArrayList<>();
     private static final Object statEntriesLock = new Object();
-    public static final int STAT_ENTRIES_LIMIT = 1000000;
+
+//    private static final IMap<String, byte[]> localIMap = new LocalIMap<>();
 
     private final long durationMillis;
     private final long warmupMillis;
@@ -44,6 +46,7 @@ public class HazelWorker implements Runnable {
     private final HazelcastInstance client;
     private final Random rnd;
     private final BlockingQueue<Integer> throttleQueue;
+    private final List<StatEntry> localStatEntries = new ArrayList<>();
 
     public HazelWorker(Config config, HazelcastInstance client, BlockingQueue<Integer> throttleQueue) {
         this.durationMillis = config.getDurationMillis();
@@ -68,15 +71,16 @@ public class HazelWorker implements Runnable {
                 LOGGER.error("Ignoring interrupt that occurred during delay.");
             }
         }
-        Map<String, byte[]> map = client.getMap(App.ANGEBOTE);
+        IMap<String, byte[]> map = client.getMap(App.ANGEBOTE);
         doTiming(map);
     }
 
-    private void doTiming(Map<String, byte[]> map) {
+    private void doTiming(IMap<String, byte[]> map) {
         LOGGER.info("Starting timing");
         double lambda = (double) numOffers; // lambda of Poisson distribution (= expected value and = variance)
         final double L = Math.exp(-lambda);
         byte[] data = new byte[numBytes];
+        rnd.nextBytes(data);
         long threadId = Thread.currentThread().getId();
         long started = System.nanoTime();
         final long end = started + durationMillis * NANOS_IN_MILLIS;
@@ -121,23 +125,13 @@ public class HazelWorker implements Runnable {
         }
         long durationMillis = (System.nanoTime() - started) / App.NANOS_IN_MILLIS;
         LOGGER.info("Timing done, {} offers created and {} offers bought in {} iterations and {}ms.", totalOffers, totalSales, totalIterations, durationMillis);
+        synchronized (statEntriesLock) {
+            statEntries.addAll(localStatEntries);
+        }
     }
 
     private void addStat(StatEntry.Type type, long threadId, long startNanos, long durationNanos, boolean success) {
-        List<StatEntry> saveBlock = null;
-        synchronized (statEntriesLock) {
-            statEntries.add(new StatEntry(type, threadId, success, startNanos, durationNanos));
-            if (statEntries.size() > STAT_ENTRIES_LIMIT) {
-                // save stats every 1'000'000 entries to avoid OOM
-                saveBlock = getStatEntries();
-                statEntries.clear();
-            }
-        }
-        if (saveBlock != null) {
-            LOGGER.info("Cleared {} stat entries to restrict memory consumption.", saveBlock.size());
-            StatSummary summary = new StatSummary(saveBlock);
-            summary.saveEntries();
-        }
+        localStatEntries.add(new StatEntry(type, threadId, success, startNanos, durationNanos));
     }
 
     /**
@@ -171,10 +165,10 @@ public class HazelWorker implements Runnable {
      * @param data array to be stored, will be updated with random data
      * @return UUID key
      */
-    private String generateOffer(Map<String, byte[]> map, byte[] data) {
-        rnd.nextBytes(data);
+    private String generateOffer(IMap<String, byte[]> map, byte[] data) {
+//        rnd.nextBytes(data);
         String key = UUID.randomUUID().toString();
-        map.put(key, data);
+        map.set(key, data);
         totalOfferCounter.incrementAndGet();
         return key;
     }
