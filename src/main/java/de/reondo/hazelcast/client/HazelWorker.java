@@ -11,6 +11,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static de.reondo.hazelcast.client.App.NANOS_IN_MILLIS;
@@ -36,37 +38,35 @@ public class HazelWorker implements Runnable {
 
     private final long durationMillis;
     private final long warmupMillis;
-    private static long pauseMillis;
     private final int numBytes;
     private final int numOffers;
     private final double probSale;
     private final HazelcastInstance client;
     private final Random rnd;
-    private final boolean throttlingEnabled;
-    private int queueClock;
-    private int totalOfferCounterOnLastQueueReset;
+    private final BlockingQueue<Integer> throttleQueue;
 
-    public HazelWorker(Config config, HazelcastInstance client) {
+    public HazelWorker(Config config, HazelcastInstance client, BlockingQueue<Integer> throttleQueue) {
         this.durationMillis = config.getDurationMillis();
         this.warmupMillis = config.getWarmupMillis();
-        this.pauseMillis = config.getPauseMillis();
         this.numBytes = config.getNumBytes();
         this.numOffers = config.getNumOffers();
         this.probSale = config.getProbSale();
-        this.throttlingEnabled = config.isThrottlingEnabled();
         rnd = new Random();
         this.client = client;
+        this.throttleQueue = throttleQueue;
     }
 
     @Override
     public void run() {
 
-        long delayMillis = rnd.nextInt((int)warmupMillis);
-        LOGGER.debug("Delaying start of timing for {}ms", delayMillis);
-        try {
-            Thread.sleep(delayMillis);
-        } catch (InterruptedException e) {
-            LOGGER.error("Ignoring interrupt that occurred during delay.");
+        if (warmupMillis > 0) {
+            long delayMillis = rnd.nextInt((int) warmupMillis);
+            LOGGER.debug("Delaying start of timing for {}ms", delayMillis);
+            try {
+                Thread.sleep(delayMillis);
+            } catch (InterruptedException e) {
+                LOGGER.error("Ignoring interrupt that occurred during delay.");
+            }
         }
         Map<String, byte[]> map = client.getMap(App.ANGEBOTE);
         doTiming(map);
@@ -80,34 +80,33 @@ public class HazelWorker implements Runnable {
         long threadId = Thread.currentThread().getId();
         long started = System.nanoTime();
         final long end = started + durationMillis * NANOS_IN_MILLIS;
-        long now = started;
         int totalIterations = 0;
         int totalOffers = 0;
         int totalSales = 0;
         while (System.nanoTime() < end) {
+            if (throttleQueue != null) {
+                try {
+                    throttleQueue.take();
+                } catch (InterruptedException e) {
+                    LOGGER.warn("Interrupted while waiting for token from throttleQueue. Aborting.");
+                    break;
+                }
+            }
             ++totalIterations;
             int nOffers = getPoisson(L);
             long before = System.nanoTime();
+            String offerId = null;
             for (int i = 0; i < nOffers; ++i) {
-                String offerId = generateOffer(map, data);
+                offerId = generateOffer(map, data);
                 ++totalOffers;
-                if (i == 0) {
-                    synchronized (offerQueueLock) {
-                        int len = offerQueue.size();
-                        if (len == 0 || rnd.nextDouble() < probSale) {
-                            // Add offer to queue
-                            offerQueue.addLast(new QueueEntry<>(offerId));
-                            if (len > 100000) {
-                                while (len-- > 50000) {
-                                    offerQueue.removeFirst(); // avoid oversized queue
-                                }
-                                LOGGER.debug("Dumped 50% oldest offerQueue entries");
-                            }
-                        }
-                    }
-                }
             }
             long after = System.nanoTime();
+            if (rnd.nextDouble() < probSale && offerId != null) {
+                synchronized (offerQueueLock) {
+                    // Add offer to queue
+                    offerQueue.addLast(new QueueEntry<>(offerId));
+                }
+            }
             addStat(WRITE, threadId, before - started, after - before, true);
             if (rnd.nextDouble() < probSale) {
                 // buy an offer according to look-book ratio
@@ -118,13 +117,6 @@ public class HazelWorker implements Runnable {
                 }
                 after = System.nanoTime();
                 addStat(READ, threadId, before - started, after - before, success);
-            }
-            if (pauseMillis > 0) {
-                try {
-                    Thread.sleep(pauseMillis);
-                } catch (InterruptedException e) {
-                    LOGGER.warn("Ignoring interrupt while pausing.");
-                }
             }
         }
         long durationMillis = (System.nanoTime() - started) / App.NANOS_IN_MILLIS;
@@ -155,54 +147,21 @@ public class HazelWorker implements Runnable {
      */
     private boolean buyOffer(Map<String, byte[]> map) {
         QueueEntry<String> key;
-        int qClock = 0;
         synchronized (offerQueueLock) {
             key = offerQueue.pollFirst();
-            qClock = queueClock;
         }
         if (key == null) {
-//            LOGGER.error("Offer queue is empty, load test bug.");
-            return false;
+            return false; // nothing in queue
         }
         byte[] data = map.get(key.getValue());
         if (data == null) {
-            if (throttlingEnabled) {
-                throttle(qClock, map, key);
+            LOGGER.warn("Eviction has removed key {}. Clearing offer queue.", key.getValue());
+            synchronized (offerQueueLock) {
+                offerQueue.clear();
             }
-            return false;
-        }
-        if (data.length != numBytes) {
-            LOGGER.error("Offer does not have size. Expected={}, actual={}.", numBytes, data.length);
             return false;
         }
         return true;
-    }
-
-    private void throttle(int qClock, Map<String, byte[]> map, QueueEntry<String> key) {
-        int delta = 0;
-        boolean doThrottle = true;
-        int queueSize = 0;
-        int mapSize = 0;
-        synchronized (offerQueueLock) {
-            int cntNow = totalOfferCounter.get();
-            if (qClock == queueClock) {
-                queueSize = offerQueue.size();
-                mapSize = map.size();
-                offerQueue.clear();
-                queueClock++;
-                pauseMillis = Math.max(20, pauseMillis + pauseMillis/2);
-                delta = cntNow - totalOfferCounterOnLastQueueReset;
-                totalOfferCounterOnLastQueueReset = cntNow;
-            } else {
-                doThrottle = false;
-            }
-        }
-        if (doThrottle) {
-            LOGGER.debug("Offer for key {} not found in map. Queue size {}, Map size {}, " +
-                            "map inserts since last throttling {}. Throttling threads.",
-                    key, queueSize, mapSize, delta);
-            LOGGER.info("Cleared queue, throttled threads to pauseMillis={}", pauseMillis);
-        }
     }
 
     /**

@@ -14,6 +14,9 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 
 /**
@@ -42,8 +45,7 @@ public class App {
         parser.accepts("t", "Number of threads").withRequiredArg().ofType(Integer.class).defaultsTo(1);
         parser.accepts("h", "Comma-separated list of Hazelcast hostnames").withRequiredArg().ofType(String.class).defaultsTo("localhost");
         parser.accepts("w", "Warmup time in seconds").withRequiredArg().ofType(Integer.class).defaultsTo(5);
-        parser.accepts("p", "Pause in milliseconds between two iterations").withRequiredArg().ofType(Integer.class).defaultsTo(0);
-        parser.accepts("l", "Disable throttling in case of failed reads");
+        parser.accepts("p", "Throughput requests/s (0=unbounded)").withRequiredArg().ofType(Integer.class).defaultsTo(0);
         parser.accepts("c", "Clear map before start of test");
         parser.accepts("dummy", "Disable smart routing (dummy client)");
         parser.accepts("redo", "Enable redo-able operations");
@@ -66,8 +68,7 @@ public class App {
         cfg.setProbSale((Double) options.valueOf("s"));
         cfg.setNumThreads((Integer) options.valueOf("t"));
         cfg.setWarmupMillis((Integer) options.valueOf("w") * 1000L);
-        cfg.setPauseMillis((Integer) options.valueOf("p") * 1L);
-        cfg.setThrottlingEnabled(!options.has("l"));
+        cfg.setThroughput((Integer) options.valueOf("p") * 1L);
         cfg.setClearMap(options.has("c"));
         List<String> hazelcastHosts = Arrays.asList(((String)options.valueOf("h")).split(","));
         cfg.setHazelcastHosts(hazelcastHosts);
@@ -85,8 +86,15 @@ public class App {
             client.getMap(ANGEBOTE).clear();
         }
         try {
+            BlockingQueue<Integer> throttleQueue = null;
+            Thread throttler = null;
+            if (config.getThroughput() > 0) {
+                throttleQueue = new LinkedBlockingQueue<>();
+                throttler = startThrottler(throttleQueue, config.getThroughput());
+            }
+
             for (int i = 0; i < ts.length; ++i) {
-                workers[i] = new HazelWorker(config, client);
+                workers[i] = new HazelWorker(config, client, throttleQueue);
                 ts[i] = new Thread(workers[i]);
             }
             long startTime = System.nanoTime();
@@ -106,11 +114,24 @@ public class App {
             LOGGER.info("Test finished after {}ms. Map has {} entries.", (endTime - startTime) / NANOS_IN_MILLIS,
                     client.getMap(ANGEBOTE).size());
             printStats();
+            if (throttler != null) {
+                throttler.interrupt();
+                try {
+                    throttler.join();
+                } catch (InterruptedException e) {
+                }
+            }
         } finally {
             if (client != null) {
                 client.shutdown(); // ensure JVM will terminate
             }
         }
+    }
+
+    private Thread startThrottler(final BlockingQueue<Integer> throttleQueue, final long throughput) {
+        Thread t = new Thread(new Throttler(throughput, throttleQueue));
+        t.start();
+        return t;
     }
 
     private void printHelpAndExit(OptionParser parser) {
@@ -174,4 +195,61 @@ public class App {
     }
 
 
+    private static class Throttler implements Runnable {
+        private final long throughput;
+        private final BlockingQueue<Integer> throttleQueue;
+
+        public Throttler(long throughput, BlockingQueue<Integer> throttleQueue) {
+            this.throughput = throughput;
+            this.throttleQueue = throttleQueue;
+        }
+
+        @Override
+        public void run() {
+            Integer token = new Integer(1);
+            double millisPerReq = 1000.0 / throughput;
+            long sleepMillis = (long) Math.floor(millisPerReq);
+            int sleepNanos = (int)((millisPerReq - sleepMillis) * 1e6);
+            LOGGER.info("Throttler enabled, emitting one token every {}ms {}ns", sleepMillis, sleepNanos);
+            long started = System.nanoTime();
+            int tokenCount = 0;
+            while (! Thread.interrupted()) {
+                try {
+                    throttleQueue.put(token);
+                    ++tokenCount;
+                    if (tokenCount > 0 && tokenCount % 100 == 0) {
+                        tokenCount += adjustThrottler(token, started, tokenCount);
+                    }
+                    Thread.sleep(sleepMillis, sleepNanos);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        }
+
+        private int adjustThrottler(Integer token, long started, int tokenCount) throws InterruptedException {
+            final double maxDeviation = 0.01;
+
+            // check every 100 tokens if our throughput is as expected
+            long now = System.nanoTime();
+            double expected = (now - started) / 1_000_000L * (throughput / 1000.0);
+            double dev = (tokenCount - expected) / expected;
+            if (dev > maxDeviation) {
+                // Over 1% more than expected: sleep for a bit
+                double millisPerReq = 1000.0 / throughput;
+                long sleepMillis = Math.max(1, (long) (Math.floor(tokenCount - expected) * millisPerReq));
+                LOGGER.debug("Sleeping for {}ms to adjust throttler", sleepMillis);
+                Thread.sleep(sleepMillis);
+            } else if (dev < -maxDeviation) {
+                // Over 1% less than expected: generate some excess tokens
+                int excessTokens = (int)(expected - tokenCount);
+                for (int i = 0; i < excessTokens ; i++){
+                    throttleQueue.put(token);
+                }
+                LOGGER.debug("Generated {} excess tokens", excessTokens);
+                return excessTokens;
+            }
+            return 0;
+        }
+    }
 }

@@ -10,8 +10,7 @@ public class ConfigBuilder {
     private double probSale = 0.2;
     private int numThreads = 1;
     private long warmupMillis = 0;
-    private long pauseMillis = 0;
-    private boolean throttlingEnabled = true;
+    private long throughput = 0;
     private List<String> hazelcastHosts = new ArrayList<>();
     private boolean clearMap;
 
@@ -45,16 +44,6 @@ public class ConfigBuilder {
         return this;
     }
 
-    public ConfigBuilder setPauseMillis(long pauseMillis) {
-        this.pauseMillis = pauseMillis;
-        return this;
-    }
-
-    public ConfigBuilder setThrottlingEnabled(boolean throttlingEnabled) {
-        this.throttlingEnabled = throttlingEnabled;
-        return this;
-    }
-
     public ConfigBuilder setHazelcastHosts(List<String> hazelcastHosts) {
         this.hazelcastHosts = hazelcastHosts;
         return this;
@@ -65,8 +54,12 @@ public class ConfigBuilder {
         return this;
     }
 
+    public void setThroughput(long throughput) {
+        this.throughput = throughput;
+    }
+
     public Config createConfig() {
-        return new Config(durationMillis, numBytes, numOffers, probSale, numThreads, warmupMillis, pauseMillis,
-                throttlingEnabled, hazelcastHosts, clearMap);
+        return new Config(durationMillis, numBytes, numOffers, probSale, numThreads, warmupMillis, throughput,
+                hazelcastHosts, clearMap);
     }
 }
